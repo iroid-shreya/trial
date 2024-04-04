@@ -1,0 +1,272 @@
+--------------------app.js
+
+require("dotenv").config();
+
+import express from "express";
+import routes from "./routes/index";
+import mongoConnection from "./model/connection";
+import "./src/common/config/jwt-strategy";
+import passport from "passport";
+import session from "express-session";
+import errorHandler from "./src/common/middleware/error-handler";
+const app = express();
+
+app.use(
+  session({
+    secret: "sk11sk",
+    resave: false,
+    saveUninitialized: true,
+  })
+);
+
+app.use(passport.initialize());
+app.use(passport.session());
+
+
+// -------------start------Send data to req body in proper format
+app.use(express.json()); //compulsary to send req body
+app.use(express.urlencoded({ extended: true }));
+// -----------end------------
+
+app.use("/", routes);
+// for send erro message 
+app.use(errorHandler);
+mongoConnection();
+app.listen(process.env.PORT, () => {
+  console.log(
+    "App running on " + process.env.BASE_URL + ":" + process.env.PORT
+  );
+});
+
+--------------------jwt-strategy
+
+import passport from "passport";
+import User from "../../../model/user";
+import { ExtractJwt, Strategy as JwtStrategy } from "passport-jwt";
+import { JWT } from "../constants/constant";
+
+const options = {
+  jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
+  secretOrKey: JWT.SECRET,
+};
+
+passport.use(
+  new JwtStrategy(options, async (jwtPayload, done) => {
+    try {
+      const user = await User.findOne({
+        _id: jwtPayload.id,
+      });
+
+      if (!user) {
+        return done(null, false);
+      }
+
+      delete user._doc.password;
+
+      return done(null, { ...user._doc, jti: jwtPayload.jti });
+    } catch (error) {
+      console.log(error);
+      return done(error, false);
+    }
+  })
+);
+
+----------------authenticate user
+import passport from "passport";
+import AccessToken from "../../../model/access-token";
+
+export default (req, res, next) => {
+  passport.authenticate("jwt", { session: false }, async (err, user) => {
+    if (!user) {
+      return res.status(401).send({ message: "Unauthorized" });
+    }
+
+    const exist = await AccessToken.findOne({
+      token: user.jti,
+      isRevoked: false,
+      userId: user._id,
+    });
+
+    if (!exist) {
+      return res.status(401).send({ message: "Unauthorized" });
+    }
+
+    req.user = user;
+
+    return next();
+  })(req, res, next);
+};
+
+
+------------store file
+
+import multer from "multer";
+import fs from "fs";
+import { randomStringGenerator } from "../helper";
+
+const storeFile = (fields) => async (req, res, next) => {
+  return new Promise((resolve, reject) => {
+    const multerStorage = multer.diskStorage({
+      destination: (req, file, cb) => {
+        const fieldDestination = fields.find(
+          (field) => field.name === file.fieldname
+        )?.destination;
+
+        fs.mkdirSync(fieldDestination, { recursive: true });
+        cb(null, fieldDestination);
+      },
+      filename: (req, file, cb) => {
+        const name = randomStringGenerator(10);
+        const ext = file.mimetype.split("/")[1];
+
+        cb(null, `${file.fieldname}-${name}.${ext}`);
+      },
+    });
+    const upload = multer({ storage: multerStorage }).fields(fields);
+
+    upload(req, res, (err) => {
+      if (err) reject(err);
+
+      resolve();
+    });
+  })
+    .then(() => next())
+    .catch((err) => {
+      res.send({ error: err });
+    });
+};
+
+export default storeFile;
+
+--------------------------------
+const registerFields = [
+  { name: "profile", destination: "mediaData/profile", maxCounts: 1 },
+  { name: "images", destination: "mediaData/other", maxCounts: 5 },
+];
+router.post(
+  "/register",
+  asyncHandler(storeFile(registerFields)),
+  validator.body(registerDto),
+  asyncHandler(AuthController.register)
+);
+
+
+----------------------------------------register
+
+static async register(reqData, files) {
+    const findUser = await User.findOne({ email: reqData.email });
+    if (findUser) {
+      return { message: "user already exist", status: 409 };
+    } else {
+      if (files.profile) {
+        reqData.profile =
+          files.profile[0].destination + "/" + files.profile[0].filename;
+      }
+      if (files.images) {
+        console.log(1);
+        reqData.images = [];
+
+        await Promise.all(
+          files.images.map((img) => {
+            reqData.images.push(img.destination + "/" + img.filename);
+          })
+        );
+
+        console.log(reqData.images);
+      }
+      reqData.password = await bcryptPassword(reqData.password);
+
+      const user = await User.create(reqData);
+
+      const randomString = await randomStringGenerator();
+
+      // generate jwt token
+      const token = await jwt.sign(
+        { id: user._id, jti: randomString },
+        JWT.SECRET, //jwt secret
+        { expiresIn: "1 YEAR" } // expire time
+      );
+
+      // store access token
+      await storeAccessToken(user, randomString);
+
+      user.token = token;
+      // const token = await
+      return user;
+    }
+  }
+
+  static async register(req, res) {
+    const data = await AuthService.register(req.body, req.files);
+
+    if (data.message) {
+      return res.status(data.status).send({ message: data.message });
+    } else {
+      return res.send({
+        data: {
+          ...new getUserResource(data),
+          auth: {
+            tokenType: "Bearer",
+            token: data.token,
+            expiresAt: expiresInSeconds,
+          },
+        },
+      });
+    }
+  }
+
+  -------------------------helper
+
+  import bcrypt from "bcryptjs";
+import moment from "moment";
+import AccessToken from "../../model/access-token";
+const Hours = 8760;
+
+export const bcryptPassword = async (password) => {
+  const hashedPassword = await new Promise((resolve, reject) => {
+    bcrypt.hash(password, 12, (err, hash) => {
+      if (err) reject(err);
+      resolve(hash);
+    });
+  });
+
+  return hashedPassword;
+};
+
+export const matchHashedPassword = async (password, userPassword) => {
+  const hashedPassword = await new Promise((resolve, reject) => {
+    bcrypt.compare(password, userPassword, (err, res) => {
+      if (err) reject(err);
+      resolve(res);
+    });
+  });
+
+  return hashedPassword;
+};
+
+export const randomStringGenerator = (givenLength = 50) => {
+  let result = "";
+  const characters =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+  const charactersLength = characters.length;
+  let counter = 0;
+  while (counter < givenLength) {
+    result += characters.charAt(Math.floor(Math.random() * charactersLength));
+    counter += 1;
+  }
+  return result;
+};
+
+export const storeAccessToken = async (user, cryptoString) => {
+  let expiresAt = moment(new Date())
+    .utc()
+    .add(Hours, "hours")
+    .format("YYYY-MM-DD hh:mm:ss");
+
+  await AccessToken.create({
+    token: cryptoString,
+    userId: user._id,
+    expiresAt: expiresAt,
+  });
+};
+
